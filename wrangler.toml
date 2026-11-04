@@ -5,7 +5,7 @@ compatibility_flags = ["enable_request_signal"] # 开启 Request.signal 客户�
 
 # 默认关闭 workers.dev 子域，避免一次 deploy 就把 test.<account>.workers.dev 对外暴露。
 # 想用子域快速试跑时改为 true，或直接删掉这两行。
-workers_dev = false
+workers_dev = true
 preview_urls = false
 
 [build]
@@ -33,10 +33,10 @@ crons = ["0 * * * *"]
 
 [[kv_namespaces]]
 binding = "ENI_KV" # 代码优先读 ENI_KV，其次读 KV
-id = "你的_KV_ID" # 你的 KV 命名空间 ID (请替换为实际的 32 位字母数字组合)
+id = "48ab5fb9ae2e405a9c25f6791478bd85" # EMBY_DATA
 
 # D1 数据库绑定声明 (D1 Database Binding)
 [[d1_databases]]
 binding = "DB" # 代码中调用该数据库的变量名
-database_name = "你的数据库名称" # 你的 D1 数据库的名称
-database_id = "你的_D1_ID" # 你的 D1 数据库 ID (请替换为实际的 UUID 格式)
+database_name = "emby-proxy-db"
+database_id = "64edb28a-e798-4b0f-9eea-e9edd7e27850"
