@@ -25,7 +25,7 @@ enabled = true
 # 可选：自定义域与旧域。代码优先读 KV 里的节点路由，这里用于生成对外链接与兼容旧入口。
 # [vars]
 # HOST = "media.example.com"
-# LEGACY_HOST = "old.example.com"
+# LEGACY_HOST = "old-emby.example.com"
 
 # KV 命名空间绑定声明 (KV Namespace Binding)
 [triggers]
@@ -33,10 +33,10 @@ crons = ["0 * * * *"]
 
 [[kv_namespaces]]
 binding = "ENI_KV" # 代码优先读 ENI_KV，其次读 KV
-id = "48ab5fb9ae2e405a9c25f6791478bd85" # EMBY_DATA
+id = "1b19107b812a403cb4a3b873e4a971dd" # EMBY_DATA
 
 # D1 数据库绑定声明 (D1 Database Binding)
 [[d1_databases]]
 binding = "DB" # 代码中调用该数据库的变量名
 database_name = "emby-proxy-db"
-database_id = "64edb28a-e798-4b0f-9eea-e9edd7e27850"
+database_id = "c505eb3f-4b43-440f-b028-6775b68ee392"
