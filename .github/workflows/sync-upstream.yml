@@ -1,0 +1,39 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天北京时间 10:50 检查上游（UTC 02:50）
+    - cron: "50 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch and merge upstream
+        run: |
+          git remote add upstream https://github.com/axuitomo/CF-EMBY-PROXY-UI.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork is already up to date."
+            exit 0
+          fi
+          git merge --no-edit -X ours upstream/main
+          git push origin HEAD:main
