@@ -20,6 +20,7 @@ import {
   buildWorkerMetadataCachePolicyRevision,
   buildWorkerMetadataPrewarmIdentityPartition,
   fetchDnsIpItemsFromUrlSource,
+  createProxyRequestLifecycle,
   createTargetRecord,
   createWorkerApplication,
   convertTmdbRequestFromUrl,
@@ -3106,6 +3107,36 @@ test("private metadata responses stay browser-private and upstream fetch bypasse
   assert.equal(Object.hasOwn(fetchOptions, "cf"), false);
 });
 
+test("only image 404/410 responses receive a short client cache lifetime", () => {
+  const imageTraits = { isImage: true };
+  const otherTraits = { isImage: false };
+  const headersFor = (
+    status,
+    requestTraits = imageTraits,
+    requestUrl = "https://worker.test/image",
+  ) =>
+    proxyService
+      .buildProxyResponseHeaders(
+        new Response("error", { status }),
+        new Request(requestUrl),
+        {},
+        "*",
+        requestTraits,
+        { imageCacheMaxAge: 3600 },
+      )
+      .get("Cache-Control");
+
+  assert.equal(headersFor(404), "public, max-age=60");
+  assert.equal(headersFor(410), "public, max-age=60");
+  assert.equal(headersFor(403), "no-store");
+  assert.equal(headersFor(500), "no-store");
+  assert.equal(headersFor(404, otherTraits), "no-store");
+  assert.equal(
+    headersFor(404, imageTraits, "https://worker.test/image?api_key=secret"),
+    "private, max-age=60",
+  );
+});
+
 test("single-flight deduplicates equal keys while distinct keys run independently", async () => {
   isolateState.SingleFlightTasks.clear();
   const sharedGate = createDeferred();
@@ -4510,6 +4541,37 @@ test("403 protocol fallback stays available for the redirect-loop state shape", 
     assert.equal(result.response.status, 200);
   } finally {
     proxyService.performFetchWithTimeout = originalPerformFetchWithTimeout;
+  }
+});
+
+test("protocol fallback keeps the retry fetch linked after the original is released", async () => {
+  const client = new AbortController();
+  const lifecycle = createProxyRequestLifecycle(client.signal);
+  const first = new AbortController();
+  const second = new AbortController();
+  const releaseFirst = lifecycle.setActiveFetchController(first);
+  const upstream = {
+    response: new Response("forbidden", { status: 403 }),
+    releaseFetchController: releaseFirst,
+  };
+  try {
+    const result = await proxyService.resolveProtocolFallbackRetry(
+      upstream,
+      upstream.response,
+      async () => ({
+        response: new Response("ok"),
+        releaseFetchController: lifecycle.setActiveFetchController(second),
+      }),
+    );
+    releaseFirst();
+    client.abort();
+    assert.equal(lifecycle.getAbortReason(), "client_aborted");
+    assert.equal(first.signal.aborted, false, "the abandoned fetch must remain detached");
+    assert.equal(second.signal.aborted, true, "the active retry must receive client cancellation");
+    result.releaseFetchController();
+    result.releaseFetchController();
+  } finally {
+    lifecycle.dispose();
   }
 });
 
@@ -9185,28 +9247,6 @@ test("managed stream errors still log under error-only mode", async () => {
   assert.equal(payloads[0].category, "error");
 });
 
-function createStreamTestLifecycle() {
-  const listeners = new Set();
-  const lifecycle = {
-    abortReason: "",
-    onAbort(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
-    getAbortReason() {
-      return this.abortReason;
-    },
-    abort(reason) {
-      this.abortReason = reason;
-      for (const listener of listeners) listener(reason);
-    },
-    dispose() {
-      listeners.clear();
-    },
-  };
-  return lifecycle;
-}
-
 function buildManagedStreamTestExecution(requestLifecycle, proxyPath) {
   return {
     requestMethod: "GET",
@@ -9222,7 +9262,7 @@ function buildManagedStreamTestExecution(requestLifecycle, proxyPath) {
 
 // 计时只覆盖等待上游数据的窗口：分片已经躺在队列里等客户端来取时不能算上游空闲。
 test("managed stream does not abort while a chunk waits for the consumer", async () => {
-  const lifecycle = createStreamTestLifecycle();
+  const lifecycle = createProxyRequestLifecycle();
   let upstreamCancelled = false;
   const upstreamState = {
     response: new Response(
@@ -9261,9 +9301,180 @@ test("managed stream does not abort while a chunk waits for the consumer", async
   }
 });
 
+test("managed stream pauses without prefetching and resumes after the idle threshold", async () => {
+  const lifecycle = createProxyRequestLifecycle();
+  let source;
+  let cancelled = false;
+  const upstreamState = {
+    response: new Response(
+      new ReadableStream({
+        start(controller) {
+          source = controller;
+          controller.enqueue(new Uint8Array([1]));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+    ),
+    finalUrl: new URL("https://origin.test/Videos/1/hls1/main/0.ts"),
+  };
+  const execution = buildManagedStreamTestExecution(lifecycle, "/Videos/1/hls1/main/0.ts");
+  const payloads = [];
+  const originalLog = proxyService.recordAccessLog;
+  const originalTimeout = proxyService.resolveResponseStreamIdleTimeoutMs;
+  proxyService.recordAccessLog = (_execution, payload) => payloads.push(payload);
+  proxyService.resolveResponseStreamIdleTimeoutMs = () => 20;
+  try {
+    const reader = proxyService
+      .buildManagedProxyResponseBody(execution, upstreamState, null)
+      .getReader();
+    assert.deepEqual((await reader.read()).value, new Uint8Array([1]));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(lifecycle.isAborted(), false);
+    assert.equal(cancelled, false);
+    assert.equal(payloads.length, 0);
+    source.enqueue(new Uint8Array([2]));
+    source.close();
+    assert.deepEqual((await reader.read()).value, new Uint8Array([2]));
+    assert.equal((await reader.read()).done, true);
+    assert.deepEqual(
+      payloads.map((payload) => payload.statusCode),
+      [200],
+    );
+  } finally {
+    lifecycle.abort("test_done");
+    proxyService.recordAccessLog = originalLog;
+    proxyService.resolveResponseStreamIdleTimeoutMs = originalTimeout;
+  }
+});
+
+for (const phase of [
+  "before construction",
+  "before reading",
+  "waiting for upstream",
+  "after a chunk",
+]) {
+  test(`managed stream terminates on client abort ${phase}`, { timeout: 1000 }, async () => {
+    const client = new AbortController();
+    const lifecycle = createProxyRequestLifecycle(client.signal);
+    let cancelled = 0;
+    let released = 0;
+    const upstreamState = {
+      response: new Response(
+        new ReadableStream({
+          start(controller) {
+            if (phase === "after a chunk") {
+              controller.enqueue(new Uint8Array([1]));
+              controller.enqueue(new Uint8Array([2]));
+            }
+          },
+          cancel() {
+            cancelled += 1;
+          },
+        }),
+      ),
+      finalUrl: new URL("https://origin.test/Videos/1/hls1/main/0.ts"),
+      releaseFetchController() {
+        released += 1;
+      },
+    };
+    const execution = buildManagedStreamTestExecution(lifecycle, "/Videos/1/hls1/main/0.ts");
+    const payloads = [];
+    const originalLog = proxyService.recordAccessLog;
+    proxyService.recordAccessLog = (_execution, payload) => payloads.push(payload);
+    try {
+      if (phase === "before construction") client.abort();
+      const reader = proxyService
+        .buildManagedProxyResponseBody(execution, upstreamState, null)
+        .getReader();
+      if (phase === "after a chunk") {
+        await reader.read();
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      const rejectedRead = assert.rejects(reader.read(), { code: "CLIENT_ABORTED" });
+      if (phase === "waiting for upstream") await new Promise((resolve) => setImmediate(resolve));
+      client.abort();
+      await rejectedRead;
+      await assert.rejects(reader.read(), { code: "CLIENT_ABORTED" });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(cancelled, 1);
+      assert.equal(released, 1);
+      assert.deepEqual(
+        payloads.map((payload) => payload.statusCode),
+        [499],
+      );
+    } finally {
+      lifecycle.dispose();
+      proxyService.recordAccessLog = originalLog;
+    }
+  });
+}
+
+for (const cancellation of ["client", "consumer"]) {
+  for (const behavior of ["pending", "throw", "reject"]) {
+    test(
+      `managed stream releases resources when ${cancellation} cancellation is ${behavior}`,
+      { timeout: 1000 },
+      async () => {
+        const client = new AbortController();
+        const lifecycle = createProxyRequestLifecycle(client.signal);
+        let released = 0;
+        let cancelled = 0;
+        const upstreamState = {
+          response: new Response(
+            new ReadableStream({
+              cancel() {
+                cancelled += 1;
+                if (behavior === "pending") return new Promise(() => {});
+                if (behavior === "throw") throw new Error("cancel failed");
+                return Promise.reject(new Error("cancel failed"));
+              },
+            }),
+          ),
+          finalUrl: new URL("https://origin.test/Videos/1/hls1/main/0.ts"),
+          releaseFetchController() {
+            released += 1;
+          },
+        };
+        const execution = buildManagedStreamTestExecution(lifecycle, "/Videos/1/hls1/main/0.ts");
+        const payloads = [];
+        const originalLog = proxyService.recordAccessLog;
+        proxyService.recordAccessLog = (_execution, payload) => payloads.push(payload);
+        try {
+          const reader = proxyService
+            .buildManagedProxyResponseBody(execution, upstreamState, null)
+            .getReader();
+          const read = reader.read();
+          const outcome =
+            cancellation === "client"
+              ? assert.rejects(read, { code: "CLIENT_ABORTED" })
+              : read.then(({ done }) => assert.equal(done, true));
+          await new Promise((resolve) => setImmediate(resolve));
+          if (cancellation === "client") client.abort();
+          else await reader.cancel();
+          await outcome;
+          client.abort();
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(upstreamState.response.body.locked, false);
+          assert.equal(cancelled, 1);
+          assert.equal(released, 1);
+          assert.deepEqual(
+            payloads.map((payload) => payload.statusCode),
+            [499],
+          );
+        } finally {
+          lifecycle.dispose();
+          proxyService.recordAccessLog = originalLog;
+        }
+      },
+    );
+  }
+}
+
 // 上游真的不再给数据时，idle 超时仍然要生效。
 test("managed stream still aborts when upstream stops sending", async () => {
-  const lifecycle = createStreamTestLifecycle();
+  const lifecycle = createProxyRequestLifecycle();
   let upstreamCancelled = false;
   const upstreamState = {
     response: new Response(
@@ -9285,8 +9496,10 @@ test("managed stream still aborts when upstream stops sending", async () => {
   proxyService.recordAccessLog = (_execution, payload) => payloads.push(payload);
   proxyService.resolveResponseStreamIdleTimeoutMs = () => 20;
   try {
-    proxyService.buildManagedProxyResponseBody(execution, upstreamState, null);
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    const body = proxyService.buildManagedProxyResponseBody(execution, upstreamState, null);
+    const reader = body.getReader();
+    await assert.rejects(reader.read(), { code: "STREAM_IDLE_TIMEOUT" });
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(upstreamCancelled, true);
     assert.deepEqual(
       payloads.map((payload) => payload.statusCode),
@@ -9386,6 +9599,75 @@ test("metadata cache storage skips compressed responses", async () => {
     assert.equal(encoded.wasCancelled(), true);
     assert.deepEqual(stored, []);
   });
+});
+
+test("whole TS media routes bypass segment timeouts while HLS segments stay managed", () => {
+  for (const path of [
+    "/Videos/1/stream.ts",
+    "/Videos/1/stream.ts?Static=true",
+    "/Videos/1/original.ts",
+    "/Audio/1/stream.ts",
+    "/Items/1/Download/full.ts",
+    "/media/full.ts?Static=true",
+    "/media/full.ts?Download=true",
+  ]) {
+    const url = new URL(`https://worker.test${path}`);
+    const traits = proxyService.classifyRequest(new Request(url), url.pathname, url, {});
+    assert.equal(traits.isBigStream, true, path);
+    assert.equal(traits.isSegment, false, path);
+    assert.equal(traits.isApiRequest, false, path);
+    assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs(traits), 0, path);
+    assert.equal(
+      proxyService.shouldManageProxyResponseBody(
+        { requestMethod: "GET", requestTraits: traits },
+        { response: new Response("media") },
+      ),
+      false,
+      path,
+    );
+  }
+  for (const path of [
+    "/Videos/1/hls1/main/0.ts",
+    "/Videos/1/hls1/main/0.m4s",
+    "/hls/0.ts",
+    "/dash/0.m4s",
+    "/Videos/1/stream/0.ts",
+    "/Videos/1/stream.m3u8/0.ts",
+    "/Videos/1/stream.ts/0.ts",
+    "/Audio/1/stream/0.ts",
+    "/Audio/1/universal/0.m4s",
+  ]) {
+    for (const query of ["", "?Static=true", "?Download=true", "?Static=true&Download=true"]) {
+      const url = new URL(`https://worker.test${path}${query}`);
+      const traits = proxyService.classifyRequest(
+        new Request(url),
+        url.pathname,
+        url,
+        {},
+        {
+          directHlsDash: true,
+        },
+      );
+      assert.equal(traits.isSegment, true, url.href);
+      assert.equal(traits.isBigStream, false, url.href);
+      assert.equal(traits.directHlsDash, true, url.href);
+      assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs(traits), 15_000, url.href);
+      assert.equal(
+        proxyService.shouldManageProxyResponseBody(
+          { requestMethod: "GET", requestTraits: traits },
+          { response: new Response("segment") },
+        ),
+        true,
+        url.href,
+      );
+    }
+  }
+  for (const path of ["/Videos/1/original/0.ts", "/Items/1/Download/nested/0.ts"]) {
+    const url = new URL(`https://worker.test${path}`);
+    const traits = proxyService.classifyRequest(new Request(url), url.pathname, url, {});
+    assert.equal(traits.isSegment, true, path);
+    assert.equal(traits.isBigStream, false, path);
+  }
 });
 
 test("audio byte streams classify as media streams instead of API requests", () => {
@@ -10214,7 +10496,12 @@ test("incremental isolate cleanup covers nonessential proxy-adjacent caches", ()
         lastProbeResult: null,
       },
     ],
-    [7, isolateState.PlaybackProgressRelay, "stale-progress", { lastTouchedAt: now - 120000 }],
+    [
+      7,
+      isolateState.PlaybackProgressRelay,
+      "stale-progress",
+      { lastTouchedAt: now - Config.Defaults.VideoProgressForwardIntervalSec * 20000 - 1 },
+    ],
     [8, isolateState.DashboardMonthlyTrafficCache, "stale-month", { staleUntil: now - 1 }],
   ];
   for (const [phase, cache, key, value] of staleCases) {
@@ -10567,12 +10854,40 @@ test("playback session keys are partitioned by node even when Emby session ids m
     makeExecution("server-b"),
     transport,
   );
-  assert.equal(first.sessionKey, "server-a|session:shared-session");
-  assert.equal(second.sessionKey, "server-b|session:shared-session");
+  assert.equal(first.sessionKey, "server-a|play:shared-play");
+  assert.equal(second.sessionKey, "server-b|play:shared-play");
   assert.notEqual(first.sessionKey, second.sessionKey);
   assert.match(first.sessionIdentityFingerprint, /^[0-9a-f]{16}$/);
   assert.match(first.sessionFingerprint, /^[0-9a-f]{16}$/);
   assert.notEqual(first.sessionFingerprint, second.sessionFingerprint);
+
+  const nextPlayback = proxyService.resolvePlaybackProgressSessionKey(makeExecution("server-a"), {
+    ...transport,
+    preparedBodyText: JSON.stringify({
+      SessionId: "shared-session",
+      PlaySessionId: "next-play",
+      ItemId: "movie-2",
+    }),
+  });
+  assert.equal(nextPlayback.sessionKey, "server-a|play:next-play");
+  assert.notEqual(first.sessionKey, nextPlayback.sessionKey);
+
+  const sessionFallback = proxyService.resolvePlaybackProgressSessionKey(
+    makeExecution("server-a"),
+    {
+      ...transport,
+      preparedBodyText: JSON.stringify({ SessionId: "shared-session", ItemId: "movie-1" }),
+    },
+  );
+  const nextItemFallback = proxyService.resolvePlaybackProgressSessionKey(
+    makeExecution("server-a"),
+    {
+      ...transport,
+      preparedBodyText: JSON.stringify({ SessionId: "shared-session", ItemId: "movie-2" }),
+    },
+  );
+  assert.equal(sessionFallback.sessionKey, "server-a|session:shared-session:movie-1");
+  assert.notEqual(sessionFallback.sessionKey, nextItemFallback.sessionKey);
 
   const deviceTransport = {
     preparedBodyMode: "buffered",
@@ -10621,6 +10936,125 @@ test("playback session keys are partitioned by node even when Emby session ids m
     `${started.sessionIdentityFingerprint}:${started.sessionFingerprint}`,
     /private|device-1|movie-1/,
   );
+});
+
+test("playback progress for a new PlaySessionId is not blocked by the prior stop tombstone", async () => {
+  const relayMap = isolateState.PlaybackProgressRelay;
+  relayMap.clear();
+  const targetRecord = createTargetRecord("https://origin.example");
+  const makeExecution = (itemId, playSessionId) => {
+    const requestUrl = new URL("https://proxy.test/Sessions/Playing/Progress");
+    return {
+      nodeName: "server-a",
+      requestMethod: "POST",
+      requestUrl,
+      proxyPath: "/Sessions/Playing/Progress",
+      clientIp: "203.0.113.10",
+      request: new Request(requestUrl, { method: "POST" }),
+      requestTraits: {
+        isPlaybackSessionControlRequest: true,
+        isPlaybackProgressRequest: true,
+      },
+      videoProgressForwardEnabled: true,
+      videoProgressForwardIntervalSec: 3,
+      ctx: { waitUntil() {} },
+      nodeDerivedCacheRevision: "rev-1",
+      finalOrigin: "*",
+      itemId,
+      playSessionId,
+    };
+  };
+  const makeTransport = (itemId, playSessionId) => {
+    const preparedBodyText = JSON.stringify({
+      SessionId: "shared-client-session",
+      PlaySessionId: playSessionId,
+      ItemId: itemId,
+    });
+    return {
+      preparedBodyMode: "buffered",
+      preparedBodyText,
+      preparedBody: new TextEncoder().encode(preparedBodyText),
+      newHeaders: new Headers({ "Content-Type": "application/json" }),
+    };
+  };
+  const oldInfo = proxyService.resolvePlaybackProgressSessionKey(
+    makeExecution("movie-1", "play-1"),
+    makeTransport("movie-1", "play-1"),
+  );
+  proxyService.markPlaybackProgressRelayStopped(oldInfo.sessionKey, {
+    videoProgressForwardIntervalSec: 3,
+    nodeName: "server-a",
+  });
+
+  const nextExecution = makeExecution("movie-2", "play-2");
+  const response = await proxyService.maybeHandlePlaybackProgressRelay(
+    nextExecution,
+    makeTransport("movie-2", "play-2"),
+    () => ({}),
+    [targetRecord],
+  );
+  assert.equal(response, null);
+  assert.equal(nextExecution.progressForwardMode, "forward_now");
+  assert.notEqual(nextExecution.progressForwardSessionKey, oldInfo.sessionKey);
+  relayMap.clear();
+});
+
+test("stopped playback keeps an acknowledged progress snapshot when flush fails", async () => {
+  const relayMap = isolateState.PlaybackProgressRelay;
+  relayMap.clear();
+  const originalForward = kernel.forwardPlaybackProgressSnapshot;
+  const scheduledTasks = [];
+  kernel.forwardPlaybackProgressSnapshot = async () => {
+    throw new Error("temporary upstream failure");
+  };
+  try {
+    const sessionKey = "server-a|play:play-1";
+    const entry = proxyService.buildPlaybackProgressRelayEntry(3000, {
+      waitUntil(task) {
+        scheduledTasks.push(task);
+      },
+    });
+    const pendingSnapshot = { requestUrl: new URL("https://origin.test/progress") };
+    entry.pendingSnapshot = pendingSnapshot;
+    relayMap.set(sessionKey, entry);
+    const requestUrl = new URL("https://proxy.test/Sessions/Playing/Stopped");
+    const execution = {
+      nodeName: "server-a",
+      requestMethod: "POST",
+      requestUrl,
+      proxyPath: "/Sessions/Playing/Stopped",
+      request: new Request(requestUrl, { method: "POST" }),
+      requestTraits: {
+        isPlaybackSessionControlRequest: true,
+        isPlaybackStoppedRequest: true,
+      },
+      videoProgressForwardEnabled: true,
+      videoProgressForwardIntervalSec: 3,
+      ctx: { waitUntil() {} },
+    };
+    const preparedBodyText = JSON.stringify({
+      SessionId: "client-session",
+      PlaySessionId: "play-1",
+      ItemId: "movie-1",
+    });
+    const transport = {
+      preparedBodyMode: "buffered",
+      preparedBodyText,
+      preparedBody: new TextEncoder().encode(preparedBodyText),
+      newHeaders: new Headers({ "Content-Type": "application/json" }),
+    };
+
+    await proxyService.maybeHandlePlaybackProgressRelay(execution, transport, () => ({}), []);
+    assert.equal(execution.progressForwardMode, "stopped_flush_retry");
+    assert.equal(entry.pendingSnapshot, pendingSnapshot);
+    assert.notEqual(entry.terminalState, "stopped");
+    assert.equal(scheduledTasks.length, 1);
+    entry.cancelScheduledDelay?.();
+    await scheduledTasks[0];
+  } finally {
+    kernel.forwardPlaybackProgressSnapshot = originalForward;
+    relayMap.clear();
+  }
 });
 
 test("node probes treat redirects as reachable", async () => {
